@@ -1,16 +1,25 @@
-// Token Radar's model (radar-2): a sealed DefiLlama snapshot in, a ranked board of pre-token
+// Token Radar's model (radar-3): a sealed DefiLlama snapshot in, a ranked board of pre-token
 // protocols out. Every number on the board is derived from the snapshot's own figures; no protocol
 // name is ever special-cased.
 //
 // THE VALUATION IS A COMPARABLES MODEL, not a flat guess. The snapshot carries 400+ protocols whose
 // token already trades, each with a market cap and a TVL: the market has already priced a dollar of
 // TVL in every category. For each category with at least MIN_CATEGORY_COMPS such protocols, the
-// board's base multiple is the MEDIAN market-cap/TVL ratio of that category's trading protocols,
-// winsorised to [RATIO_FLOOR, RATIO_CAP] so one mania cannot set the price of a whole category.
-// Categories too thin to price fall back to the global median over every trading protocol. A
-// pre-token protocol's base value is then its own TVL times the multiple of the company it keeps:
+// board's base multiple starts from the MEDIAN market-cap/TVL ratio of that category's trading
+// protocols, winsorised to [RATIO_FLOOR, RATIO_CAP] so one mania cannot set the price of a whole
+// category, and is then SHRUNK toward the global median over every trading protocol:
 //
-//   base      = tvl_usd x category_multiple          (the market's revealed price of its TVL)
+//   multiple  = (n x category_median + SHRINK_WEIGHT x global_median) / (n + SHRINK_WEIGHT)
+//
+// Shrinkage is the honest treatment of a small sample: a category priced by fifteen peers keeps
+// most of its own median, a category priced by four borrows strength from the whole market, and
+// no thin category's noise is read as signal. Categories too thin to price at all fall back to
+// the global median outright. Every category also publishes the SPREAD of its peers' ratios
+// (the 25th to 75th percentile), and every row carries a CONFIDENCE tier read off the evidence
+// behind its price: how many peers priced it, and how tightly those peers agree. A pre-token
+// protocol's base value is then its own TVL times the multiple of the company it keeps:
+//
+//   base      = tvl_usd x multiple                   (the market's revealed price of its TVL)
 //   growth    = clamp(change_7d, -50, +100) percent  (a hot week is worth something, not everything)
 //   growthMult   = max(0.5, 1 + growth/100 x 0.6)
 //   maturity  = 0.70 + 0.50 x sqrt(min(age_days, 1460) / 1460)
@@ -57,6 +66,8 @@ export interface ModelConstants {
   ratio_floor: number;
   ratio_cap: number;
   min_category_comps: number;
+  shrink_weight: number;
+  confidence_high_comps: number;
   growth_weight: number;
   growth_floor_pct: number;
   growth_cap_pct: number;
@@ -71,6 +82,8 @@ export const MODEL: ModelConstants = {
   ratio_floor: 0.01,
   ratio_cap: 10,
   min_category_comps: 4,
+  shrink_weight: 4,
+  confidence_high_comps: 8,
   growth_weight: 0.6,
   growth_floor_pct: -50,
   growth_cap_pct: 100,
@@ -82,7 +95,10 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label, named on the dashboard. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
+
+/** How much evidence stands behind one row's price: many agreeing peers, some peers, or the global pool alone. */
+export type Confidence = 'high' | 'medium' | 'low';
 
 /** How many already-trading protocols the dashboard's comparables view lists, by market cap. */
 export const LIVE_ROWS = 30;
@@ -91,12 +107,16 @@ export const LIVE_ROWS = 30;
 export interface CompStat {
   category: string;
   median_ratio: number;
+  p25_ratio: number;
+  p75_ratio: number;
   comps: number;
 }
 
-/** The comparables table: per-category medians plus the global fallback. */
+/** The comparables table: per-category medians and spreads plus the global fallback. */
 export interface Comps {
   global_median: number;
+  global_p25: number;
+  global_p75: number;
   global_comps: number;
   by_category: Map<string, CompStat>;
 }
@@ -128,6 +148,10 @@ export interface BoardRow {
   model: {
     multiple: number;
     multiple_basis: 'category' | 'global';
+    category_median: number | null;
+    spread_p25: number;
+    spread_p75: number;
+    confidence: Confidence;
     comps: number;
     growth_pct: number;
     growth_multiplier: number;
@@ -166,7 +190,7 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
-  comps_global: { median_ratio: number; comps: number };
+  comps_global: { median_ratio: number; p25_ratio: number; p75_ratio: number; comps: number };
   comps: CompStat[];
   rows: RadarRow[];
   live: LiveRow[];
@@ -230,6 +254,22 @@ function median(values: number[]): number {
 }
 
 /**
+ * A quantile of a non-empty list by linear interpolation between the two nearest ranks, on a
+ * sorted copy. The 25th and 75th percentiles bracket the middle half of a category's peers: the
+ * spread the dashboard publishes beside every median, so a reader can see whether a multiple is
+ * a consensus or a coin toss.
+ */
+function quantile(values: number[], q: number): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  if (sorted.length === 1) return sorted[0]!;
+  const pos = (sorted.length - 1) * q;
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  if (lo === hi) return sorted[lo]!;
+  return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (pos - lo);
+}
+
+/**
  * The comparables: every protocol whose token trades and whose record carries both a market cap
  * and a TVL contributes its market-cap/TVL ratio, winsorised, to its category and to the global
  * pool. This table is the model's only notion of what a TVL dollar is worth, and it comes from the
@@ -250,24 +290,77 @@ export function buildComps(snapshot: Snapshot, model: ModelConstants = MODEL): C
   }
   const stats = new Map<string, CompStat>();
   for (const [category, ratios] of byCategory) {
-    stats.set(category, { category, median_ratio: round4(median(ratios)), comps: ratios.length });
+    stats.set(category, {
+      category,
+      median_ratio: round4(median(ratios)),
+      p25_ratio: round4(quantile(ratios, 0.25)),
+      p75_ratio: round4(quantile(ratios, 0.75)),
+      comps: ratios.length,
+    });
   }
   return {
     global_median: all.length > 0 ? round4(median(all)) : 0.2,
+    global_p25: all.length > 0 ? round4(quantile(all, 0.25)) : 0.2,
+    global_p75: all.length > 0 ? round4(quantile(all, 0.75)) : 0.2,
     global_comps: all.length,
     by_category: stats,
   };
 }
 
-/** The multiple one protocol is priced with: its category's median when the category has enough trading peers, else the global median. */
-export function multipleFor(category: string | null, comps: Comps, model: ModelConstants = MODEL): { multiple: number; basis: 'category' | 'global'; comps: number } {
+/** What one protocol's price rests on: the multiple, its basis, the raw category median behind it, the spread of the pool that priced it, and the peer count. */
+export interface Pricing {
+  multiple: number;
+  basis: 'category' | 'global';
+  category_median: number | null;
+  spread_p25: number;
+  spread_p75: number;
+  comps: number;
+}
+
+/**
+ * The multiple one protocol is priced with. When the category has enough trading peers, its
+ * median is shrunk toward the global median with the peer count as its weight:
+ * (n x category + SHRINK_WEIGHT x global) / (n + SHRINK_WEIGHT). A category of fifteen peers
+ * keeps most of its own price; a category of four borrows half its price from the whole market,
+ * because four ratios are a hint, not a measurement. Thinner than that, the global median
+ * prices the row outright and the row says so.
+ */
+export function multipleFor(category: string | null, comps: Comps, model: ModelConstants = MODEL): Pricing {
   if (category !== null) {
     const stat = comps.by_category.get(category);
     if (stat !== undefined && stat.comps >= model.min_category_comps) {
-      return { multiple: stat.median_ratio, basis: 'category', comps: stat.comps };
+      const blended = (stat.comps * stat.median_ratio + model.shrink_weight * comps.global_median) / (stat.comps + model.shrink_weight);
+      return {
+        multiple: round4(blended),
+        basis: 'category',
+        category_median: stat.median_ratio,
+        spread_p25: stat.p25_ratio,
+        spread_p75: stat.p75_ratio,
+        comps: stat.comps,
+      };
     }
   }
-  return { multiple: comps.global_median, basis: 'global', comps: comps.global_comps };
+  return {
+    multiple: comps.global_median,
+    basis: 'global',
+    category_median: null,
+    spread_p25: comps.global_p25,
+    spread_p75: comps.global_p75,
+    comps: comps.global_comps,
+  };
+}
+
+/**
+ * The confidence a row's price has earned, from the evidence behind it alone. High asks for a
+ * category of at least CONFIDENCE_HIGH_COMPS peers whose middle half spans no more than the
+ * median itself: many peers, in rough agreement. A category price on fewer or disagreeing
+ * peers is medium. A price read off the global pool, because the category was too thin to
+ * speak, is low: not a guess, but the market's average rather than its own line of business.
+ */
+export function confidenceFor(pricing: Pricing, model: ModelConstants = MODEL): Confidence {
+  if (pricing.basis === 'global') return 'low';
+  const tight = pricing.spread_p75 - pricing.spread_p25 <= (pricing.category_median ?? 0);
+  return pricing.comps >= model.confidence_high_comps && tight ? 'high' : 'medium';
 }
 
 /** The full decomposition of one protocol's implied value under the model. */
@@ -276,15 +369,15 @@ export function impliedValue(
   asOf: string,
   comps: Comps,
   model: ModelConstants = MODEL,
-): { implied: number; multiple: number; basis: 'category' | 'global'; comps: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
+): { implied: number; pricing: Pricing; confidence: Confidence; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
-  const { multiple, basis, comps: n } = multipleFor(protocol.category, comps, model);
+  const pricing = multipleFor(protocol.category, comps, model);
   const growthPct = Math.min(model.growth_cap_pct, Math.max(model.growth_floor_pct, finite(protocol.change_7d, 0)));
   const growthMult = Math.max(model.growth_min_mult, 1 + (growthPct / 100) * model.growth_weight);
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_base + model.maturity_range * Math.sqrt(Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days);
-  const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult));
-  return { implied, multiple, basis, comps: n, growthPct, growthMult, maturityMult, age };
+  const implied = Math.max(1, Math.round(protocol.tvl_usd * pricing.multiple * growthMult * maturityMult));
+  return { implied, pricing, confidence: confidenceFor(pricing, model), growthPct, growthMult, maturityMult, age };
 }
 
 /** The snapshot's protocol by slug. */
@@ -334,9 +427,13 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     age_days: s.age,
     implied_value_usd: s.implied,
     model: {
-      multiple: s.multiple,
-      multiple_basis: s.basis,
-      comps: s.comps,
+      multiple: s.pricing.multiple,
+      multiple_basis: s.pricing.basis,
+      category_median: s.pricing.category_median,
+      spread_p25: s.pricing.spread_p25,
+      spread_p75: s.pricing.spread_p75,
+      confidence: s.confidence,
+      comps: s.pricing.comps,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
@@ -547,7 +644,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     board_size: board.length,
     early_size: board.filter((r) => !watchlist.has(r.slug)).length,
     live_size: live.length,
-    comps_global: { median_ratio: comps.global_median, comps: comps.global_comps },
+    comps_global: { median_ratio: comps.global_median, p25_ratio: comps.global_p25, p75_ratio: comps.global_p75, comps: comps.global_comps },
     comps: [...comps.by_category.values()].sort((a, b) => b.comps - a.comps || (a.category < b.category ? -1 : 1)),
     rows,
     live,
@@ -565,7 +662,9 @@ export function parseSnapshot(text: string): Snapshot {
   }
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new SnapshotError('snapshot.json is not a JSON object');
   const o = raw as Record<string, unknown>;
-  if (typeof o.as_of !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(o.as_of)) throw new SnapshotError('snapshot.json has no as_of date');
+  if (typeof o.as_of !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(o.as_of) || !Number.isFinite(Date.parse(`${o.as_of}T00:00:00Z`))) {
+    throw new SnapshotError('snapshot.json has no as_of date');
+  }
   if (typeof o.source !== 'string') throw new SnapshotError('snapshot.json has no source');
   if (typeof o.floor_usd !== 'number' || !Number.isSafeInteger(o.floor_usd) || o.floor_usd <= 0) throw new SnapshotError('snapshot.json has no floor_usd');
   if (!Array.isArray(o.protocols)) throw new SnapshotError('snapshot.json has no protocols array');
@@ -575,6 +674,10 @@ export function parseSnapshot(text: string): Snapshot {
     const p = v as Record<string, unknown>;
     if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) {
       throw new SnapshotError(`snapshot.json's protocol ${i} lacks a slug, a name or a TVL`);
+    }
+    if (p.tvl_usd < 0) throw new SnapshotError(`snapshot.json's protocol ${i} (${p.slug}) has a negative TVL`);
+    if (typeof p.listed_at === 'string' && !/^\d{4}-\d{2}-\d{2}$/.test(p.listed_at)) {
+      throw new SnapshotError(`snapshot.json's protocol ${i} (${p.slug}) has a listed_at that is not a date`);
     }
     return {
       slug: p.slug,
@@ -589,20 +692,43 @@ export function parseSnapshot(text: string): Snapshot {
       symbol: typeof p.symbol === 'string' ? p.symbol : null,
     };
   });
+  // A slug is a protocol's identity everywhere downstream: a duplicate would silently shadow a
+  // protocol in the index, and a watchlist slug the file does not carry can never be covered.
+  // Both are refused here, at the door, rather than discovered as a missing row at the gate.
+  const seenSlugs = new Set<string>();
+  for (const p of protocols) {
+    if (seenSlugs.has(p.slug)) throw new SnapshotError(`snapshot.json lists protocol ${p.slug} twice`);
+    seenSlugs.add(p.slug);
+  }
+  const watchlist = o.watchlist as string[];
+  if (new Set(watchlist).size !== watchlist.length) throw new SnapshotError('snapshot.json lists a watchlist slug twice');
+  for (const slug of watchlist) {
+    if (!seenSlugs.has(slug)) throw new SnapshotError(`snapshot.json's watchlist names ${slug}, which its protocols do not carry`);
+  }
   return {
     as_of: o.as_of,
     source: o.source,
     floor_usd: o.floor_usd,
     protocols,
-    watchlist: o.watchlist as string[],
+    watchlist,
   };
 }
 
-/** Why a board is not one the gate will take, or null: coverage, ranks, order, one shared implied value, and farm steps. */
+/** Why a board is not one the gate will take, or null: coverage, ranks, order, one shared implied value, farm steps, and the model's own invariants. */
 export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null {
   const slugs = new Set(board.map((r) => r.slug));
+  if (slugs.size !== board.length) return 'the board carries a slug twice';
   const missing = snapshot.watchlist.filter((s) => !slugs.has(s));
   if (missing.length > 0) return `the board misses ${missing.length} watchlist slug${missing.length === 1 ? '' : 's'}: ${missing.slice(0, 5).join(', ')}`;
+  for (const r of board) {
+    const m = r.model;
+    if (!(m.multiple >= MODEL.ratio_floor && m.multiple <= MODEL.ratio_cap)) return `${r.slug} is priced at ${m.multiple}x, outside the winsorised band`;
+    if (m.multiple_basis === 'category' && m.comps < MODEL.min_category_comps) return `${r.slug} claims a category price on ${m.comps} peers`;
+    if (m.multiple_basis === 'category' && m.category_median === null) return `${r.slug} claims a category price with no category median`;
+    if (m.multiple_basis === 'global' && m.category_median !== null) return `${r.slug} claims the global price but carries a category median`;
+    if (m.spread_p25 > m.spread_p75) return `${r.slug} has an inverted spread`;
+    if (m.confidence !== 'high' && m.confidence !== 'medium' && m.confidence !== 'low') return `${r.slug} has an unknown confidence tier`;
+  }
   const ranks = board.map((r) => r.rank).sort((a, b) => a - b);
   for (let i = 0; i < ranks.length; i++) if (ranks[i] !== i + 1) return `rank ${i + 1} is ${ranks[i]}`;
   for (let i = 1; i < board.length; i++) if (board[i]!.implied_value_usd > board[i - 1]!.implied_value_usd) return `row ${i + 1} outranks row ${i} on implied value`;
