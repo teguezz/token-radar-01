@@ -111,6 +111,9 @@ td.cat, td.chains { font-family: var(--sans); font-size: 12.5px; color: var(--di
 }
 .badge.wl { color: #14100a; background: var(--amber); font-weight: 700; }
 .badge.early { color: var(--blue); border: 1px solid var(--blue); }
+.badge.conf-high { color: #06110b; background: var(--acc); font-weight: 700; margin-left: 0; }
+.badge.conf-medium { color: var(--blue); border: 1px solid var(--blue); margin-left: 0; }
+.badge.conf-low { color: var(--faint); border: 1px solid var(--line2); margin-left: 0; }
 .pos { color: var(--acc); }
 .neg { color: var(--red); }
 .bar { display: inline-block; vertical-align: middle; width: 74px; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-left: 9px; }

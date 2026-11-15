@@ -1,4 +1,4 @@
-// Token Launch Radar (radar-2): a static dashboard over window.RADAR, the dataset main.ts writes
+// Token Launch Radar (radar-3): a static dashboard over window.RADAR, the dataset main.ts writes
 // beside this page from the sealed snapshot. No network: every figure on screen is in data.js,
 // every farm plan is the one board.json carries, and the detail view shows the model's own
 // decomposition for the row, so what the page says and what the board says cannot drift apart.
@@ -59,6 +59,7 @@
   }
   function header() {
     var totalImplied = D.rows.reduce(function (s, r) { return s + r.implied_value_usd; }, 0);
+    var onCategory = D.rows.filter(function (r) { return r.model.multiple_basis === 'category'; }).length;
     var wrap = el('header', null,
       el('p', { 'class': 'eyebrow', text: 'Token launch radar · model ' + D.model_version }),
       el('h1', null, 'Pre-token protocols, ', el('span', { 'class': 'thin', text: 'priced by the company they keep' })),
@@ -71,6 +72,7 @@
         statBox('Watchlist covered', el('span', null, el('em', { text: D.watchlist_size + ' / ' + D.watchlist_size }))),
         statBox('Board rows', String(D.board_size)),
         statBox('Early finds below floor', String(D.early_size)),
+        statBox('Priced on category evidence', Math.round((onCategory / D.board_size) * 100) + '%'),
         statBox('Board implied total', fmtUsd(totalImplied)))
     );
     var topComps = D.comps.filter(function (c) { return c.comps >= M.min_category_comps; }).slice(0, 6);
@@ -78,8 +80,10 @@
       el('div', { 'class': 'formula' },
         'implied = TVL x ', el('b', { text: 'category multiple' }), ' x ', el('b', { text: 'growth' }), ' x ', el('b', { text: 'maturity' })),
       el('div', { 'class': 'note', text:
-        'The multiple is the median market-cap / TVL of the category\u2019s trading protocols in this snapshot ' +
-        '(global median ' + D.comps_global.median_ratio.toFixed(3) + 'x over ' + D.comps_global.comps + ' protocols where a category is too thin). ' +
+        'The multiple starts from the median market-cap / TVL of the category\u2019s trading protocols in this snapshot, ' +
+        'then shrinks toward the global median (' + D.comps_global.median_ratio.toFixed(3) + 'x over ' + D.comps_global.comps +
+        ' protocols) with the peer count as its weight, so a thin category borrows the market\u2019s price instead of trusting four ratios. ' +
+        'Where a category is too thin it falls back to the global median outright. Every row carries the confidence its evidence earns. ' +
         'Growth reads the 7-day TVL change; maturity credits years run with no token. Full method on the Method tab.' }),
       el('div', { 'class': 'chips' }, topComps.map(function (c) {
         return el('span', { 'class': 'chip' }, c.category + ' ', el('b', { text: c.median_ratio.toFixed(3) + 'x' }), ' · ' + c.comps + ' peers');
@@ -127,6 +131,7 @@
       growth: function (r) { return r.change_7d === null ? -1e9 : r.change_7d; },
       age: function (r) { return r.age_days === null ? -1 : r.age_days; },
       mult: function (r) { return r.model.multiple; },
+      conf: function (r) { return { high: 3, medium: 2, low: 1 }[r.model.confidence]; },
       rank: function (r) { return r.rank; },
     }[key];
     rows.sort(function (a, b) { return dir * (val(a) - val(b)) || (a.slug < b.slug ? -1 : 1); });
@@ -176,7 +181,7 @@
       el('thead', null, el('tr', null,
         sortHead('#', 'rank'), sortHead('Protocol', 'rank', 'l'), el('th', { 'class': 'l' }, 'Category'),
         el('th', { 'class': 'l' }, 'Chains'), sortHead('TVL', 'tvl'), sortHead('7d', 'growth'),
-        sortHead('Age', 'age'), sortHead('Multiple', 'mult'), sortHead('Implied value', 'implied'))),
+        sortHead('Age', 'age'), sortHead('Multiple', 'mult'), sortHead('Conf.', 'conf'), sortHead('Implied value', 'implied'))),
       el('tbody', { id: 'boardbody' })
     );
     var view = el('div', null, toolbar, table);
@@ -203,6 +208,7 @@
         el('td', { 'class': r.change_7d === null ? '' : (r.change_7d >= 0 ? 'pos' : 'neg'), text: fmtPct(r.change_7d) }),
         el('td', { text: fmtAge(r.age_days) }),
         el('td', { text: fmtMult(r.model.multiple) }),
+        el('td', null, el('span', { 'class': 'badge conf-' + r.model.confidence, text: r.model.confidence.toUpperCase() })),
         el('td', { 'class': 'imp' }, fmtUsd(r.implied_value_usd), barSpan(pct))
       ));
     });
@@ -241,15 +247,24 @@
         cellOf('Running since', r.listed_at || 'unknown'),
         cellOf('Age with no token', fmtAge(r.age_days)),
         cellOf('Category multiple', fmtMult(m.multiple)),
+        cellOf('Price confidence', m.confidence.toUpperCase()),
         cellOf('Chains', String(r.chains.length)),
         cellOf('Implied / TVL', fmtMult(r.implied_value_usd / r.tvl_usd))),
       el('h3', { 'class': 'sec', text: 'How the model prices it' }),
       el('div', { 'class': 'decomp' },
         decompRow('TVL in the snapshot', fmtUsd(r.tvl_usd)),
-        decompRow('x category multiple (' + (m.multiple_basis === 'category' ? 'median of ' + m.comps + ' trading ' + (r.category || '') + ' protocols' : 'global median, category too thin: ' + m.comps + ' protocols') + ')', fmtMult(m.multiple)),
+        m.multiple_basis === 'category'
+          ? decompRow('category median (market-cap / TVL of ' + m.comps + ' trading ' + (r.category || '') + ' protocols)', fmtMult(m.category_median))
+          : decompRow('category median', 'too thin to use'),
+        m.multiple_basis === 'category'
+          ? decompRow('x multiple (median shrunk toward the global ' + D.comps_global.median_ratio.toFixed(3) + 'x: (' + m.comps + ' x median + ' + M.shrink_weight + ' x global) / ' + (m.comps + M.shrink_weight) + ')', fmtMult(m.multiple))
+          : decompRow('x multiple (global median: this category has too few trading peers to price itself)', fmtMult(m.multiple)),
+        decompRow('peer spread (middle half of the ratios behind the price)', m.spread_p25.toFixed(3) + 'x \u2013 ' + m.spread_p75.toFixed(3) + 'x'),
         decompRow('x growth (7d change ' + fmtPct(m.growth_pct) + ', clamped)', m.growth_multiplier.toFixed(3) + 'x'),
         decompRow('x maturity (' + fmtAge(r.age_days) + ' run with no token)', m.maturity_multiplier.toFixed(3) + 'x'),
         decompRow('Implied value if it launched at these figures', fmtUsd(r.implied_value_usd), 'total')),
+      el('p', { 'class': 'facts' },
+        'Confidence ', el('b', { text: m.confidence.toUpperCase() }), ': ', confidenceNote(r)),
       el('h3', { 'class': 'sec', text: 'Farm plan: ' + r.farm_plan.length + ' steps' }),
       el('ol', { 'class': 'plan' }, r.farm_plan.map(function (s) {
         return el('li', null,
@@ -270,6 +285,12 @@
     detailRoot.hidden = false;
     detailRoot.scrollTop = 0;
   }
+  function confidenceNote(r) {
+    var m = r.model;
+    if (m.confidence === 'high') return 'priced by ' + m.comps + ' trading peers in its own category, and the middle half of their ratios spans no more than the median itself: many peers, in rough agreement.';
+    if (m.confidence === 'medium') return 'priced by ' + m.comps + ' trading peers in its own category, but they are few or they disagree: the multiple is shrunk toward the global median to allow for it.';
+    return 'its category has too few trading peers to price it, so the price is the global median over ' + D.comps_global.comps + ' trading protocols: the market\u2019s average, not this line of business\u2019s own price.';
+  }
   function cellOf(k, v) {
     return el('div', { 'class': 'cell' }, el('div', { 'class': 'k', text: k }), el('div', { 'class': 'v', text: v }));
   }
@@ -283,13 +304,19 @@
     var maxRatio = Math.max.apply(null, usable.map(function (c) { return c.median_ratio; }).concat([0.001]));
     var compTable = el('table', { 'class': 'plain' },
       el('thead', null, el('tr', null,
-        el('th', { 'class': 'l' }, 'Category'), el('th', null, 'Median mcap / TVL'), el('th', null, 'Trading peers'), el('th', { 'class': 'l' }, 'Used for'))),
+        el('th', { 'class': 'l' }, 'Category'), el('th', null, 'Median mcap / TVL'), el('th', null, 'Spread p25\u2013p75'),
+        el('th', null, 'Trading peers'), el('th', null, 'Board multiple'), el('th', { 'class': 'l' }, 'Used for'))),
       el('tbody', null, usable.map(function (c) {
         var used = c.comps >= M.min_category_comps;
+        var boardMult = used
+          ? (c.comps * c.median_ratio + M.shrink_weight * D.comps_global.median_ratio) / (c.comps + M.shrink_weight)
+          : D.comps_global.median_ratio;
         return el('tr', null,
           el('td', { 'class': 'l', text: c.category }),
           el('td', null, c.median_ratio.toFixed(3) + 'x', barSpan(Math.max(2, (c.median_ratio / maxRatio) * 100))),
+          el('td', { text: c.p25_ratio.toFixed(3) + 'x \u2013 ' + c.p75_ratio.toFixed(3) + 'x' }),
           el('td', { text: String(c.comps) }),
+          el('td', { text: boardMult.toFixed(3) + 'x' }),
           el('td', { 'class': 'l', text: used ? 'This category\u2019s rows' : 'Too thin: global median instead' }));
       })));
     var liveTable = el('table', { 'class': 'plain' },
@@ -308,11 +335,14 @@
       el('div', { 'class': 'prose' },
         el('h2', { text: 'The comparables: where the multiples come from' }),
         el('p', null,
-          'The board invents no prices. Each multiple below is the median market-cap-to-TVL ratio of the protocols ' +
+          'The board invents no prices. Each multiple below starts from the median market-cap-to-TVL ratio of the protocols ' +
           'in that category whose token already trades in this snapshot, winsorised to [0.01x, 10x] so one outlier ' +
-          'cannot price a category. A pre-token protocol is priced at the multiple of the company it keeps; a category ' +
-          'with fewer than ' + M.min_category_comps + ' trading peers falls back to the global median of ' +
-          D.comps_global.median_ratio.toFixed(3) + 'x over ' + D.comps_global.comps + ' protocols.')),
+          'cannot price a category. The spread column is the middle half of that category\u2019s ratios: where it is wide, ' +
+          'the peers disagree and the price deserves less trust. The board multiple is what rows are actually priced at: ' +
+          'the median shrunk toward the global median with the peer count as its weight, (n x median + ' + M.shrink_weight +
+          ' x global) / (n + ' + M.shrink_weight + '). A category with fewer than ' + M.min_category_comps + ' trading peers ' +
+          'falls back to the global median of ' + D.comps_global.median_ratio.toFixed(3) + 'x over ' + D.comps_global.comps +
+          ' protocols (its own middle half: ' + D.comps_global.p25_ratio.toFixed(3) + 'x \u2013 ' + D.comps_global.p75_ratio.toFixed(3) + 'x).')),
       compTable,
       el('div', { 'class': 'prose' }, el('h3', { text: 'Already trading: kept off the board, shown for scale' })),
       liveTable);
@@ -350,8 +380,17 @@
       el('h3', { text: '3. The value model' }),
       el('p', { 'class': 'formula', text: 'implied = TVL x category multiple x growth multiplier x maturity multiplier' }),
       p(b('Category multiple.'), ' The median market-cap / TVL of the category\u2019s trading protocols in this snapshot ' +
-        '(see Comparables), winsorised to [0.01x, 10x], with the global median as the fallback for thin categories. ' +
-        'This is the market\u2019s own revealed price of a TVL dollar in that line of business.'),
+        '(see Comparables), winsorised to [0.01x, 10x] so no single mania prices a category, then shrunk toward the ' +
+        'global median with the peer count as its weight: (n x category median + ' + M.shrink_weight + ' x global median) / ' +
+        '(n + ' + M.shrink_weight + '). Fifteen peers keep most of their own price; four peers borrow half of theirs from ' +
+        'the whole market, because four ratios are a hint, not a measurement. A category with fewer than ' +
+        M.min_category_comps + ' peers does not price at all: its rows take the global median outright. This is the ' +
+        'market\u2019s own revealed price of a TVL dollar in that line of business, discounted by how much evidence stands behind it.'),
+      p(b('Spread and confidence.'), ' Every category also publishes the middle half of its peers\u2019 ratios (the 25th to ' +
+        '75th percentile). Each row is stamped with the confidence its price earned: ', b('high'), ' when at least ' +
+        M.confidence_high_comps + ' peers price it and their middle half spans no more than the median itself; ', b('medium'),
+        ' when a category prices it on fewer or disagreeing peers; ', b('low'), ' when the price is the global median because ' +
+        'the category was too thin to speak. The stamp changes no number: it tells the reader how far to trust the one printed.'),
       p(b('Growth.'), ' The 7-day TVL change, clamped to [\u221250%, +100%], moves the value by up to \u00d760% of itself: ' +
         'a protocol gathering TVL is worth more than the same TVL standing still, and a collapsing one less, but one week never rewrites the price.'),
       p(b('Maturity.'), ' A multiplier from 0.70x to 1.20x on the square root of the protocol\u2019s age, saturating at four years. ' +
@@ -364,7 +403,14 @@
         'lending, swap and provide for a DEX, margin and hedge for derivatives, deposit and hold for a vault), its first chain ' +
         'sets the gas costs, its TVL sets a sane position size, and its age sets the holding window. Every step names its cost ' +
         'and its time. A plan assumes a points or allocation program may one day read the wallet\u2019s history; it never promises one exists.'),
-      el('h3', { text: '5. What this is not' }),
+      el('h3', { text: '5. Data hygiene' }),
+      p('The snapshot is validated before it is priced: a duplicated protocol slug, a negative TVL, a malformed ' +
+        'first-tracked date, or a watchlist slug the protocol list does not carry stops the run with an error rather ' +
+        'than silently pricing a corrupted board. Sentinel market caps are not evidence: the snapshot records a market ' +
+        'cap of 0 for some trading protocols and \u22121 for one, and a comparable must carry a market cap above zero and ' +
+        'a TVL above zero before its ratio enters any pool. The program is deterministic: the same snapshot in, the ' +
+        'same board out, byte for byte, on every run.'),
+      el('h3', { text: '6. What this is not' }),
       p('Implied value is not a forecast and not a tip. It says: if this protocol issued a token today and the market priced ' +
         'it the way it prices its trading peers, the launch would be worth about this. Whether it ever issues one, and what ' +
         'the market would actually pay, are questions the snapshot does not answer and this page does not pretend to.')
