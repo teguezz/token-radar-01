@@ -4,7 +4,7 @@ A token launch radar for make.fun's `token-radar-01` bounty. It reads a sealed
 DefiLlama snapshot, finds every protocol that records no token yet, prices each
 one with a comparables model derived from the snapshot's own figures, ranks
 them into a board, gives each a concrete farm plan, and renders the result as a
-static dashboard. Model version: **radar-3**.
+static dashboard. Model version: **radar-4**.
 
 The board's implied value is this entry's own claim about what a launch would
 be worth if the protocol's record stayed as it is. It is not a prediction that
@@ -76,18 +76,29 @@ multiple = (n x category median + 4 x global median) / (n + 4)
 
 Fifteen peers keep most of their own price; four peers borrow half of theirs
 from the whole market, because four ratios are a hint, not a measurement.
-Categories thinner than 4 peers fall back to the global median outright.
-86 rows are priced on category evidence; 112 on the global pool.
+Categories thinner than 4 peers do not price themselves — but they are not
+sent straight to the global pool. DefiLlama splits one line of business
+across sibling labels, so the model pools them into **families** (Risk
+Curators with Onchain Capital Allocator; Derivatives, Options, Options Vault
+and Interest Rate Derivatives; and six more, all fixed in the model and
+listed on the dashboard's Comparables tab). A thin category is priced by its
+family when the family holds at least 3 peers, the family median shrunk
+harder toward the global median — `(n x family median + 8 x global) / (n + 8)`
+— because a family's evidence is broader and blunter than a category's own.
+Only a category with no family evidence falls back to the global median
+outright. 161 rows are priced on category or family evidence (75 of them by
+a family pool); 37 on the global pool.
 
 **Spread and confidence.** Each category publishes the middle half of its
 peers' ratios (25th–75th percentile). Each row is stamped with the confidence
 its price earned: **high** — at least 8 peers and a middle half no wider than
-the median itself; **medium** — a category price on fewer or disagreeing
-peers; **low** — the global median, because the category was too thin to
-speak. The stamp changes no number; it tells the reader how far to trust the
-one printed. Board outcome: 16 high, 70 medium, 112 low — the board's largest
-rows sit in thin categories (a one-peer category cannot price itself), and the
-dashboard says so on their face.
+the median itself; **medium** — a category or family price on fewer or
+disagreeing peers; **low** — the global median, because neither the category
+nor its family could speak. The stamp changes no number; it tells the reader
+how far to trust the one printed. Board outcome: 16 high, 145 medium, 37
+low — the board's largest rows sit in categories too thin to price
+themselves (a zero-peer category cannot price itself), so the family tier
+prices them and stamps them medium, and the dashboard says so on their face.
 
 **Growth.** The 7-day TVL change, clamped to **[−50%, +100%]**, scaled by
 0.6 into a multiplier floored at 0.5: a hot week is worth something, not
