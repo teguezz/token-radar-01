@@ -1,4 +1,4 @@
-// Token Launch Radar (radar-3): a static dashboard over window.RADAR, the dataset main.ts writes
+// Token Launch Radar (radar-4): a static dashboard over window.RADAR, the dataset main.ts writes
 // beside this page from the sealed snapshot. No network: every figure on screen is in data.js,
 // every farm plan is the one board.json carries, and the detail view shows the model's own
 // decomposition for the row, so what the page says and what the board says cannot drift apart.
@@ -72,7 +72,7 @@
         statBox('Watchlist covered', el('span', null, el('em', { text: D.watchlist_size + ' / ' + D.watchlist_size }))),
         statBox('Board rows', String(D.board_size)),
         statBox('Early finds below floor', String(D.early_size)),
-        statBox('Priced on category evidence', Math.round((onCategory / D.board_size) * 100) + '%'),
+        statBox('Priced on category or family evidence', Math.round((onCategory / D.board_size) * 100) + '%'),
         statBox('Board implied total', fmtUsd(totalImplied)))
     );
     var topComps = D.comps.filter(function (c) { return c.comps >= M.min_category_comps; }).slice(0, 6);
@@ -83,7 +83,9 @@
         'The multiple starts from the median market-cap / TVL of the category\u2019s trading protocols in this snapshot, ' +
         'then shrinks toward the global median (' + D.comps_global.median_ratio.toFixed(3) + 'x over ' + D.comps_global.comps +
         ' protocols) with the peer count as its weight, so a thin category borrows the market\u2019s price instead of trusting four ratios. ' +
-        'Where a category is too thin it falls back to the global median outright. Every row carries the confidence its evidence earns. ' +
+        'Where a category is too thin to price itself, its family of sibling categories prices it instead, on at least ' +
+        M.family_min_comps + ' pooled peers shrunk harder toward the global median; only a category with no family evidence ' +
+        'falls back to the global median outright. Every row carries the confidence its evidence earns. ' +
         'Growth reads the 7-day TVL change; maturity credits years run with no token. Full method on the Method tab.' }),
       el('div', { 'class': 'chips' }, topComps.map(function (c) {
         return el('span', { 'class': 'chip' }, c.category + ' ', el('b', { text: c.median_ratio.toFixed(3) + 'x' }), ' · ' + c.comps + ' peers');
@@ -246,19 +248,23 @@
         cellOf('TVL change, 7d', fmtPct(r.change_7d)),
         cellOf('Running since', r.listed_at || 'unknown'),
         cellOf('Age with no token', fmtAge(r.age_days)),
-        cellOf('Category multiple', fmtMult(m.multiple)),
+        cellOf('Multiple applied', fmtMult(m.multiple)),
         cellOf('Price confidence', m.confidence.toUpperCase()),
         cellOf('Chains', String(r.chains.length)),
         cellOf('Implied / TVL', fmtMult(r.implied_value_usd / r.tvl_usd))),
       el('h3', { 'class': 'sec', text: 'How the model prices it' }),
       el('div', { 'class': 'decomp' },
         decompRow('TVL in the snapshot', fmtUsd(r.tvl_usd)),
-        m.multiple_basis === 'category'
+        m.multiple_basis === 'category' && m.pricing_pool === r.category
           ? decompRow('category median (market-cap / TVL of ' + m.comps + ' trading ' + (r.category || '') + ' protocols)', fmtMult(m.category_median))
-          : decompRow('category median', 'too thin to use'),
-        m.multiple_basis === 'category'
+          : m.multiple_basis === 'category'
+            ? decompRow('family median (market-cap / TVL of ' + m.comps + ' trading protocols in the ' + m.pricing_pool + ' family; ' + (r.category || 'this category') + ' itself is too thin)', fmtMult(m.category_median))
+            : decompRow('category median', 'too thin to use'),
+        m.multiple_basis === 'category' && m.pricing_pool === r.category
           ? decompRow('x multiple (median shrunk toward the global ' + D.comps_global.median_ratio.toFixed(3) + 'x: (' + m.comps + ' x median + ' + M.shrink_weight + ' x global) / ' + (m.comps + M.shrink_weight) + ')', fmtMult(m.multiple))
-          : decompRow('x multiple (global median: this category has too few trading peers to price itself)', fmtMult(m.multiple)),
+          : m.multiple_basis === 'category'
+            ? decompRow('x multiple (family median shrunk harder toward the global ' + D.comps_global.median_ratio.toFixed(3) + 'x: (' + m.comps + ' x median + ' + M.family_shrink_weight + ' x global) / ' + (m.comps + M.family_shrink_weight) + ')', fmtMult(m.multiple))
+            : decompRow('x multiple (global median: neither this category nor its family has enough trading peers to price it)', fmtMult(m.multiple)),
         decompRow('peer spread (middle half of the ratios behind the price)', m.spread_p25.toFixed(3) + 'x \u2013 ' + m.spread_p75.toFixed(3) + 'x'),
         decompRow('x growth (7d change ' + fmtPct(m.growth_pct) + ', clamped)', m.growth_multiplier.toFixed(3) + 'x'),
         decompRow('x maturity (' + fmtAge(r.age_days) + ' run with no token)', m.maturity_multiplier.toFixed(3) + 'x'),
@@ -287,9 +293,12 @@
   }
   function confidenceNote(r) {
     var m = r.model;
-    if (m.confidence === 'high') return 'priced by ' + m.comps + ' trading peers in its own category, and the middle half of their ratios spans no more than the median itself: many peers, in rough agreement.';
-    if (m.confidence === 'medium') return 'priced by ' + m.comps + ' trading peers in its own category, but they are few or they disagree: the multiple is shrunk toward the global median to allow for it.';
-    return 'its category has too few trading peers to price it, so the price is the global median over ' + D.comps_global.comps + ' trading protocols: the market\u2019s average, not this line of business\u2019s own price.';
+    var where = m.pricing_pool === null ? '' : (m.pricing_pool === r.category
+      ? 'in its own category'
+      : 'in the ' + m.pricing_pool + ' family pool (its own category is too thin to price it)');
+    if (m.confidence === 'high') return 'priced by ' + m.comps + ' trading peers ' + where + ', and the middle half of their ratios spans no more than the median itself: many peers, in rough agreement.';
+    if (m.confidence === 'medium') return 'priced by ' + m.comps + ' trading peers ' + where + ', but they are few or they disagree: the multiple is shrunk toward the global median to allow for it.';
+    return 'neither its category nor its family has enough trading peers to price it, so the price is the global median over ' + D.comps_global.comps + ' trading protocols: the market\u2019s average, not this line of business\u2019s own price.';
   }
   function cellOf(k, v) {
     return el('div', { 'class': 'cell' }, el('div', { 'class': 'k', text: k }), el('div', { 'class': 'v', text: v }));
@@ -307,17 +316,33 @@
         el('th', { 'class': 'l' }, 'Category'), el('th', null, 'Median mcap / TVL'), el('th', null, 'Spread p25\u2013p75'),
         el('th', null, 'Trading peers'), el('th', null, 'Board multiple'), el('th', { 'class': 'l' }, 'Used for'))),
       el('tbody', null, usable.map(function (c) {
-        var used = c.comps >= M.min_category_comps;
+        var w = c.family ? M.family_shrink_weight : M.shrink_weight;
+        var used = c.comps >= (c.family ? M.family_min_comps : M.min_category_comps);
         var boardMult = used
-          ? (c.comps * c.median_ratio + M.shrink_weight * D.comps_global.median_ratio) / (c.comps + M.shrink_weight)
+          ? (c.comps * c.median_ratio + w * D.comps_global.median_ratio) / (c.comps + w)
           : D.comps_global.median_ratio;
+        var usedFor;
+        if (c.family) {
+          usedFor = used ? 'Family pool: prices its thin categories' : 'Family pool too thin: not used';
+        } else if (used) {
+          usedFor = 'This category\u2019s rows';
+        } else {
+          var famName = D.category_family[c.category];
+          var famStat = famName ? D.comps.filter(function (x) { return x.family && x.category === famName; })[0] : null;
+          if (famStat && famStat.comps >= M.family_min_comps) {
+            boardMult = (famStat.comps * famStat.median_ratio + M.family_shrink_weight * D.comps_global.median_ratio) / (famStat.comps + M.family_shrink_weight);
+            usedFor = 'Too thin alone: priced by the ' + famName + ' family pool';
+          } else {
+            usedFor = 'Too thin: global median instead';
+          }
+        }
         return el('tr', null,
-          el('td', { 'class': 'l', text: c.category }),
+          el('td', { 'class': 'l', text: c.family ? c.category + ' (family pool)' : c.category }),
           el('td', null, c.median_ratio.toFixed(3) + 'x', barSpan(Math.max(2, (c.median_ratio / maxRatio) * 100))),
           el('td', { text: c.p25_ratio.toFixed(3) + 'x \u2013 ' + c.p75_ratio.toFixed(3) + 'x' }),
           el('td', { text: String(c.comps) }),
           el('td', { text: boardMult.toFixed(3) + 'x' }),
-          el('td', { 'class': 'l', text: used ? 'This category\u2019s rows' : 'Too thin: global median instead' }));
+          el('td', { 'class': 'l', text: usedFor }));
       })));
     var liveTable = el('table', { 'class': 'plain' },
       el('thead', null, el('tr', null,
@@ -340,8 +365,13 @@
           'cannot price a category. The spread column is the middle half of that category\u2019s ratios: where it is wide, ' +
           'the peers disagree and the price deserves less trust. The board multiple is what rows are actually priced at: ' +
           'the median shrunk toward the global median with the peer count as its weight, (n x median + ' + M.shrink_weight +
-          ' x global) / (n + ' + M.shrink_weight + '). A category with fewer than ' + M.min_category_comps + ' trading peers ' +
-          'falls back to the global median of ' + D.comps_global.median_ratio.toFixed(3) + 'x over ' + D.comps_global.comps +
+          ' x global) / (n + ' + M.shrink_weight + '). Between a category and the global pool sit the family pools, marked ' +
+          'as such below: DefiLlama labels that name one line of business (Risk Curators with Onchain Capital Allocator, ' +
+          'the derivatives and options labels together, and so on) pooled into a single evidence pool. A category with ' +
+          'fewer than ' + M.min_category_comps + ' trading peers is priced by its family when the family holds at least ' +
+          M.family_min_comps + ' peers, the family median shrunk toward the global median with the heavier weight ' +
+          M.family_shrink_weight + ', because a family\u2019s evidence is broader and blunter than a category\u2019s own. ' +
+          'The rest fall back to the global median of ' + D.comps_global.median_ratio.toFixed(3) + 'x over ' + D.comps_global.comps +
           ' protocols (its own middle half: ' + D.comps_global.p25_ratio.toFixed(3) + 'x \u2013 ' + D.comps_global.p75_ratio.toFixed(3) + 'x).')),
       compTable,
       el('div', { 'class': 'prose' }, el('h3', { text: 'Already trading: kept off the board, shown for scale' })),
@@ -384,13 +414,16 @@
         'global median with the peer count as its weight: (n x category median + ' + M.shrink_weight + ' x global median) / ' +
         '(n + ' + M.shrink_weight + '). Fifteen peers keep most of their own price; four peers borrow half of theirs from ' +
         'the whole market, because four ratios are a hint, not a measurement. A category with fewer than ' +
-        M.min_category_comps + ' peers does not price at all: its rows take the global median outright. This is the ' +
+        M.min_category_comps + ' peers does not price itself: it is priced by its family, the pooled ratios of the sibling ' +
+        'labels that name the same line of business, when that pool holds at least ' + M.family_min_comps + ' peers \u2014 shrunk ' +
+        'harder toward the global median, with weight ' + M.family_shrink_weight + ', because the evidence is broader and ' +
+        'blunter. Only a category with no family evidence takes the global median outright. This is the ' +
         'market\u2019s own revealed price of a TVL dollar in that line of business, discounted by how much evidence stands behind it.'),
       p(b('Spread and confidence.'), ' Every category also publishes the middle half of its peers\u2019 ratios (the 25th to ' +
         '75th percentile). Each row is stamped with the confidence its price earned: ', b('high'), ' when at least ' +
         M.confidence_high_comps + ' peers price it and their middle half spans no more than the median itself; ', b('medium'),
-        ' when a category prices it on fewer or disagreeing peers; ', b('low'), ' when the price is the global median because ' +
-        'the category was too thin to speak. The stamp changes no number: it tells the reader how far to trust the one printed.'),
+        ' when a category or a family prices it on fewer or disagreeing peers; ', b('low'), ' when the price is the global median because ' +
+        'neither its category nor its family could speak. The stamp changes no number: it tells the reader how far to trust the one printed.'),
       p(b('Growth.'), ' The 7-day TVL change, clamped to [\u221250%, +100%], moves the value by up to \u00d760% of itself: ' +
         'a protocol gathering TVL is worth more than the same TVL standing still, and a collapsing one less, but one week never rewrites the price.'),
       p(b('Maturity.'), ' A multiplier from 0.70x to 1.20x on the square root of the protocol\u2019s age, saturating at four years. ' +
