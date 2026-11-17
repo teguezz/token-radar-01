@@ -1,4 +1,4 @@
-// Token Radar's model (radar-3): a sealed DefiLlama snapshot in, a ranked board of pre-token
+// Token Radar's model (radar-4): a sealed DefiLlama snapshot in, a ranked board of pre-token
 // protocols out. Every number on the board is derived from the snapshot's own figures; no protocol
 // name is ever special-cased.
 //
@@ -13,11 +13,19 @@
 //
 // Shrinkage is the honest treatment of a small sample: a category priced by fifteen peers keeps
 // most of its own median, a category priced by four borrows strength from the whole market, and
-// no thin category's noise is read as signal. Categories too thin to price at all fall back to
-// the global median outright. Every category also publishes the SPREAD of its peers' ratios
-// (the 25th to 75th percentile), and every row carries a CONFIDENCE tier read off the evidence
-// behind its price: how many peers priced it, and how tightly those peers agree. A pre-token
-// protocol's base value is then its own TVL times the multiple of the company it keeps:
+// no thin category's noise is read as signal.
+//
+// RADAR-4 ADDS A FAMILY TIER between the category and the global fallback. DefiLlama splits one
+// line of business across sibling labels (Risk Curators and Onchain Capital Allocator are the same
+// trade; Derivatives, Options, Options Vault and Interest Rate Derivatives are one book). A
+// category too thin to price itself is priced by its FAMILY: the pooled ratios of its sibling
+// categories, at least FAMILY_MIN_COMPS of them, shrunk harder toward the global median
+// (FAMILY_SHRINK_WEIGHT) because a family's evidence is broader and blunter than a category's own.
+// Only a category with no family evidence takes the global median outright. Every category also
+// publishes the SPREAD of its peers' ratios (the 25th to 75th percentile), and every row carries a
+// CONFIDENCE tier read off the evidence behind its price: how many peers priced it, and how tightly
+// those peers agree. A pre-token protocol's base value is then its own TVL times the multiple of
+// the company it keeps:
 //
 //   base      = tvl_usd x multiple                   (the market's revealed price of its TVL)
 //   growth    = clamp(change_7d, -50, +100) percent  (a hot week is worth something, not everything)
@@ -67,6 +75,8 @@ export interface ModelConstants {
   ratio_cap: number;
   min_category_comps: number;
   shrink_weight: number;
+  family_min_comps: number;
+  family_shrink_weight: number;
   confidence_high_comps: number;
   growth_weight: number;
   growth_floor_pct: number;
@@ -83,6 +93,8 @@ export const MODEL: ModelConstants = {
   ratio_cap: 10,
   min_category_comps: 4,
   shrink_weight: 4,
+  family_min_comps: 3,
+  family_shrink_weight: 8,
   confidence_high_comps: 8,
   growth_weight: 0.6,
   growth_floor_pct: -50,
@@ -94,8 +106,29 @@ export const MODEL: ModelConstants = {
   unknown_age_days: 365,
 };
 
+/**
+ * Category families: DefiLlama labels that name one line of business, pooled as one evidence pool.
+ * The grouping is fixed here, in the open, and applies to every protocol alike: it reads category
+ * labels only, never a protocol's name. A family prices only the categories inside it that are too
+ * thin to price themselves.
+ */
+export const FAMILIES: Record<string, string[]> = {
+  'Capital allocation': ['Risk Curators', 'Onchain Capital Allocator'],
+  'Derivatives & options': ['Derivatives', 'Options', 'Options Vault', 'Interest Rate Derivatives'],
+  'Lending & credit': ['Lending', 'Uncollateralized Lending', 'Collateral Markets'],
+  'Real-world assets': ['RWA', 'RWA Lending'],
+  'Yield & farming': ['Yield', 'Yield Aggregator', 'Farm', 'Basis Trading', 'Anchor BTC Yield'],
+  'DEX & liquidity': ['Dexs', 'Dexs Aggregator', 'Concentrated Liquidity Manager', 'Liquidity manager'],
+  'Staking & restaking': ['Staking Pool', 'Restaking', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC'],
+  'Interoperability': ['Cross Chain', 'Bridge', 'Canonical Bridge'],
+};
+const FAMILY_OF = new Map<string, string>();
+for (const [family, categories] of Object.entries(FAMILIES)) {
+  for (const category of categories) FAMILY_OF.set(category, family);
+}
+
 /** The model's version label, named on the dashboard. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How much evidence stands behind one row's price: many agreeing peers, some peers, or the global pool alone. */
 export type Confidence = 'high' | 'medium' | 'low';
@@ -110,6 +143,8 @@ export interface CompStat {
   p25_ratio: number;
   p75_ratio: number;
   comps: number;
+  /** True when this row is a family pool (several sibling categories pooled), not one category. */
+  family: boolean;
 }
 
 /** The comparables table: per-category medians and spreads plus the global fallback. */
@@ -119,6 +154,7 @@ export interface Comps {
   global_p75: number;
   global_comps: number;
   by_category: Map<string, CompStat>;
+  by_family: Map<string, CompStat>;
 }
 
 /** A farm step: the action, what it costs, and how long it takes. */
@@ -148,6 +184,8 @@ export interface BoardRow {
   model: {
     multiple: number;
     multiple_basis: 'category' | 'global';
+    /** The pool that priced the row: its own category's name, its family's name, or null on the global price. */
+    pricing_pool: string | null;
     category_median: number | null;
     spread_p25: number;
     spread_p75: number;
@@ -192,6 +230,8 @@ export interface RadarData {
   live_size: number;
   comps_global: { median_ratio: number; p25_ratio: number; p75_ratio: number; comps: number };
   comps: CompStat[];
+  /** Which family each category belongs to, for the categories that have one. */
+  category_family: Record<string, string>;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -296,6 +336,26 @@ export function buildComps(snapshot: Snapshot, model: ModelConstants = MODEL): C
       p25_ratio: round4(quantile(ratios, 0.25)),
       p75_ratio: round4(quantile(ratios, 0.75)),
       comps: ratios.length,
+      family: false,
+    });
+  }
+  const familyRatios = new Map<string, number[]>();
+  for (const [category, ratios] of byCategory) {
+    const family = FAMILY_OF.get(category);
+    if (family === undefined) continue;
+    const list = familyRatios.get(family);
+    if (list === undefined) familyRatios.set(family, [...ratios]);
+    else list.push(...ratios);
+  }
+  const famStats = new Map<string, CompStat>();
+  for (const [family, ratios] of familyRatios) {
+    famStats.set(family, {
+      category: family,
+      median_ratio: round4(median(ratios)),
+      p25_ratio: round4(quantile(ratios, 0.25)),
+      p75_ratio: round4(quantile(ratios, 0.75)),
+      comps: ratios.length,
+      family: true,
     });
   }
   return {
@@ -304,13 +364,16 @@ export function buildComps(snapshot: Snapshot, model: ModelConstants = MODEL): C
     global_p75: all.length > 0 ? round4(quantile(all, 0.75)) : 0.2,
     global_comps: all.length,
     by_category: stats,
+    by_family: famStats,
   };
 }
 
-/** What one protocol's price rests on: the multiple, its basis, the raw category median behind it, the spread of the pool that priced it, and the peer count. */
+/** What one protocol's price rests on: the multiple, its basis, the pool that priced it, the raw pool median behind it, the spread of that pool, and the peer count. */
 export interface Pricing {
   multiple: number;
   basis: 'category' | 'global';
+  /** The pricing pool's name: the row's own category, its family, or null when the global pool priced it. */
+  pool: string | null;
   category_median: number | null;
   spread_p25: number;
   spread_p75: number;
@@ -318,12 +381,15 @@ export interface Pricing {
 }
 
 /**
- * The multiple one protocol is priced with. When the category has enough trading peers, its
- * median is shrunk toward the global median with the peer count as its weight:
- * (n x category + SHRINK_WEIGHT x global) / (n + SHRINK_WEIGHT). A category of fifteen peers
- * keeps most of its own price; a category of four borrows half its price from the whole market,
- * because four ratios are a hint, not a measurement. Thinner than that, the global median
- * prices the row outright and the row says so.
+ * The multiple one protocol is priced with, in three tiers. First its own category: when the
+ * category has enough trading peers, its median is shrunk toward the global median with the peer
+ * count as its weight: (n x category + SHRINK_WEIGHT x global) / (n + SHRINK_WEIGHT). A category
+ * of fifteen peers keeps most of its own price; a category of four borrows half its price from
+ * the whole market, because four ratios are a hint, not a measurement. Second, its family: a
+ * category thinner than that is priced by the pooled ratios of its sibling categories when the
+ * family holds at least FAMILY_MIN_COMPS peers, shrunk harder (FAMILY_SHRINK_WEIGHT) because a
+ * family's evidence is broader and blunter. Only a category with no family evidence takes the
+ * global median outright, and the row says so.
  */
 export function multipleFor(category: string | null, comps: Comps, model: ModelConstants = MODEL): Pricing {
   if (category !== null) {
@@ -333,16 +399,34 @@ export function multipleFor(category: string | null, comps: Comps, model: ModelC
       return {
         multiple: round4(blended),
         basis: 'category',
+        pool: category,
         category_median: stat.median_ratio,
         spread_p25: stat.p25_ratio,
         spread_p75: stat.p75_ratio,
         comps: stat.comps,
       };
     }
+    const family = FAMILY_OF.get(category);
+    if (family !== undefined) {
+      const fam = comps.by_family.get(family);
+      if (fam !== undefined && fam.comps >= model.family_min_comps) {
+        const blended = (fam.comps * fam.median_ratio + model.family_shrink_weight * comps.global_median) / (fam.comps + model.family_shrink_weight);
+        return {
+          multiple: round4(blended),
+          basis: 'category',
+          pool: family,
+          category_median: fam.median_ratio,
+          spread_p25: fam.p25_ratio,
+          spread_p75: fam.p75_ratio,
+          comps: fam.comps,
+        };
+      }
+    }
   }
   return {
     multiple: comps.global_median,
     basis: 'global',
+    pool: null,
     category_median: null,
     spread_p25: comps.global_p25,
     spread_p75: comps.global_p75,
@@ -429,6 +513,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     model: {
       multiple: s.pricing.multiple,
       multiple_basis: s.pricing.basis,
+      pricing_pool: s.pricing.pool,
       category_median: s.pricing.category_median,
       spread_p25: s.pricing.spread_p25,
       spread_p75: s.pricing.spread_p75,
@@ -645,7 +730,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     early_size: board.filter((r) => !watchlist.has(r.slug)).length,
     live_size: live.length,
     comps_global: { median_ratio: comps.global_median, p25_ratio: comps.global_p25, p75_ratio: comps.global_p75, comps: comps.global_comps },
-    comps: [...comps.by_category.values()].sort((a, b) => b.comps - a.comps || (a.category < b.category ? -1 : 1)),
+    comps: [...comps.by_category.values(), ...comps.by_family.values()].sort((a, b) => b.comps - a.comps || (a.category < b.category ? -1 : 1)),
+    category_family: Object.fromEntries(FAMILY_OF),
     rows,
     live,
   };
@@ -723,9 +809,14 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
   for (const r of board) {
     const m = r.model;
     if (!(m.multiple >= MODEL.ratio_floor && m.multiple <= MODEL.ratio_cap)) return `${r.slug} is priced at ${m.multiple}x, outside the winsorised band`;
-    if (m.multiple_basis === 'category' && m.comps < MODEL.min_category_comps) return `${r.slug} claims a category price on ${m.comps} peers`;
+    if (m.multiple_basis === 'category' && m.pricing_pool === null) return `${r.slug} claims a category price with no pricing pool`;
+    if (m.multiple_basis === 'category' && m.pricing_pool !== null) {
+      const minPeers = m.pricing_pool === r.category ? MODEL.min_category_comps : MODEL.family_min_comps;
+      if (m.comps < minPeers) return `${r.slug} claims a price from pool ${m.pricing_pool} on ${m.comps} peers`;
+    }
     if (m.multiple_basis === 'category' && m.category_median === null) return `${r.slug} claims a category price with no category median`;
     if (m.multiple_basis === 'global' && m.category_median !== null) return `${r.slug} claims the global price but carries a category median`;
+    if (m.multiple_basis === 'global' && m.pricing_pool !== null) return `${r.slug} claims the global price but names a pricing pool`;
     if (m.spread_p25 > m.spread_p75) return `${r.slug} has an inverted spread`;
     if (m.confidence !== 'high' && m.confidence !== 'medium' && m.confidence !== 'low') return `${r.slug} has an unknown confidence tier`;
   }
