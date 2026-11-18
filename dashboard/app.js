@@ -75,23 +75,7 @@
         statBox('Priced on category or family evidence', Math.round((onCategory / D.board_size) * 100) + '%'),
         statBox('Board implied total', fmtUsd(totalImplied)))
     );
-    var topComps = D.comps.filter(function (c) { return c.comps >= M.min_category_comps; }).slice(0, 6);
-    var strip = el('div', { 'class': 'model-strip' },
-      el('div', { 'class': 'formula' },
-        'implied = TVL x ', el('b', { text: 'category multiple' }), ' x ', el('b', { text: 'growth' }), ' x ', el('b', { text: 'maturity' })),
-      el('div', { 'class': 'note', text:
-        'The multiple starts from the median market-cap / TVL of the category\u2019s trading protocols in this snapshot, ' +
-        'then shrinks toward the global median (' + D.comps_global.median_ratio.toFixed(3) + 'x over ' + D.comps_global.comps +
-        ' protocols) with the peer count as its weight, so a thin category borrows the market\u2019s price instead of trusting four ratios. ' +
-        'Where a category is too thin to price itself, its family of sibling categories prices it instead, on at least ' +
-        M.family_min_comps + ' pooled peers shrunk harder toward the global median; only a category with no family evidence ' +
-        'falls back to the global median outright. Every row carries the confidence its evidence earns. ' +
-        'Growth reads the 7-day TVL change; maturity credits years run with no token. Full method on the Method tab.' }),
-      el('div', { 'class': 'chips' }, topComps.map(function (c) {
-        return el('span', { 'class': 'chip' }, c.category + ' ', el('b', { text: c.median_ratio.toFixed(3) + 'x' }), ' · ' + c.comps + ' peers');
-      }))
-    );
-    return el('div', null, wrap, strip);
+    return wrap;
   }
 
   /* ---------- tabs ---------- */
